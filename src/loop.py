@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 
 
-def loss_fn(x: Tensor, y: Tensor, params: Collection[Tensor], buffer:Collection[Tensor], model: nn.Module) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+def loss_fn(
+    x: Tensor, y: Tensor, params: Collection[Tensor], buffer:Collection[Tensor], model: nn.Module) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
     """Compute the loss and logits for a single batch of data.
     
     Args:
@@ -23,7 +24,9 @@ def loss_fn(x: Tensor, y: Tensor, params: Collection[Tensor], buffer:Collection[
     """
     x = x.unsqueeze(0)
     y = y.unsqueeze(0)
-    logits = functional_call(model, (params, buffer), (x,))
+    # we need to use functional call of the model as this function is used in the vmap
+    # thus no stateful operations are allowed
+    logits = functional_call(model, (params, buffer), (x,)) 
     loss = F.cross_entropy(logits, y)
     return loss, (loss, logits.squeeze())
 
