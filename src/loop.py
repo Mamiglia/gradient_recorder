@@ -1,3 +1,4 @@
+import shutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,111 +31,106 @@ def loss_fn(
     loss = F.cross_entropy(logits, y)
     return loss, (loss, logits.squeeze())
 
-
-
 def record_model(
-    model: nn.Module, loader, 
-    device='cuda', chunk_size=32, 
-    path_to_disk=None,
-    keep_memory=False
-    ) -> Optional[Tuple[Mapping[str, Tensor], Tensor, Tensor, Tensor]]:
-    """Record the behaviour of the model on the given loader.
-    
-    For each sample computes and stores the:
-    - loss
-    - logits
-    - gradients of the loss with respect to the model parameters
-    - gradients of the loss with respect to the input
-    
-    Args:
-    model: model to record
-    loader: data loader
-    device: device to use
-    chunk_size: size of the chunk for the vmap operation
-    path_to_disk: path to save the recorded data, if None the data is not saved
-    keep_memory: if True, the recorded data is kept in memory
-    """
+    model, loader, device='cuda', chunk_size=-1, 
+    path_to_disk=None, keep_memory=False
+):
+    """Record the behaviour of the model on the given loader."""
     assert not keep_memory or not path_to_disk, "Either keep_memory or path_to_disk must be True"
-    model.eval()
-    model = model.to(device)
+    model.eval().to(device)
+    
+    if path_to_disk:
+        path_to_disk = Path(path_to_disk)
+        shutil.rmtree(path_to_disk, ignore_errors=True)  # Remove the directory and all its contents
+        path_to_disk.mkdir(parents=True, exist_ok=True)
+        (path_to_disk / 'grad_sample').mkdir()
+        (path_to_disk / 'grad_params').mkdir()
+        (path_to_disk / 'loss_logits').mkdir()
     
     params = {k: v.detach() for k, v in model.named_parameters()}
     buffers = {k: v.detach() for k, v in model.named_buffers()}
+    chunk_size = chunk_size if chunk_size > 0 else loader.batch_size
     
-    # define the derivative of the loss with respect to the model parameters and the input
-    loss_logits_grads = vmap(                       # vmap over the batch dimension
-    grad(                                       # gradient over the model parameters and the input
-        loss_fn, argnums=(0, 2), has_aux=True   # argnums=(0, 2) means that we want to differentiate with respect to the first and third argument
-                            # has_aux=True means that the function returns also the loss and the logits
-    ), in_dims=(0, 0, None, None, None),        # in_dims specifies which is the batch dimension of x, y
-    chunk_size=chunk_size)
+    # define a function that records the behaviour of the model on a single sample of data
+    # we do this through functional transforms to improve performance
+    compute_gradients = vmap(              # vmap over the batch dimension
+        grad(                              # gradient over the model parameters and the input
+            loss_fn, 
+            argnums=(0, 2), has_aux=True   # argnums=(0, 2) means that we want to differentiate with respect to the first and third argument
+                                            # has_aux=True means that the function returns also the loss and the logits
+        ), in_dims=(0, 0, None, None, None),# in_dims specifies which is the batch dimension of x, y
+        chunk_size=chunk_size)
+    
+        
+    results = [
+        result
+        for batch_idx, (x, y) in enumerate(tqdm(loader))
+        for result in process_batch(
+            model, x, y, params, buffers, compute_gradients, batch_idx, 
+            device, path_to_disk, keep_memory
+        )
+    ]
     
     if path_to_disk:
-        os.makedirs(path_to_disk, exist_ok=True)
-    
-    # define a function that records the behaviour of the model on a single batch of data
-    def record_fn(x, y, batch_idx) -> Tuple[Tensor, Mapping[str, Tensor], Tensor, Tensor]:
-        """Record the behaviour of the model on a single batch of data."""
-        x = x.to(device)
-        y = y.to(device)
-        
-        samples = []
-        
-        (grads_sample, grads_params), (loss, logits) = loss_logits_grads(x, y, params, buffers, model)
-        
-        if path_to_disk:
-            for i in range(x.shape[0]):
-                path = Path(path_to_disk) / f'{batch_idx}_{i}'
-                os.makedirs(path, exist_ok=True)
-                
-                torch.save(grads_sample[i], path / 'grads_sample.pt')
-                torch.save(loss[i], path / 'loss.pt')
-                torch.save(logits[i], path / 'logits.pt')
-                torch.save({k:p[i] for k,p in grads_params.items()}, path / 'grads_params.pt')
-                
-                samples.append({
-                    'path': path,
-                    'batch_idx': batch_idx,
-                    'sample_idx': i,
-                    'grads_sample': path / 'grads_sample.pt',
-                    'grads_params': path / 'grads_params.pt',
-                    'loss': path / 'loss.pt',
-                    'logits': path / 'logits.pt',
-                    'label': y[i].item()
-                })
-                
-        if not keep_memory:
-            return (samples,)
-        
-        grads_sample, loss, logits = grads_sample.detach().cpu(), loss.detach().cpu(), logits.detach().cpu()
-        for k in grads_params:
-            grads_params[k] = grads_params[k].detach().cpu()
-        
-        return samples, grads_sample, grads_params, loss, logits
-    
-    # records is a list of tuples (grads_sample, grads_params, loss, logits)
-    # we need to concatenate the tensors along the batch dimension
-    records = [record_fn(x, y, idx) for idx, (x, y) in enumerate(tqdm(loader))]
-    
-    if path_to_disk:
-        df = pd.DataFrame([s for r in records for s in r[0]])
-        df.to_csv(Path(path_to_disk) / 'metadata.csv', index=False)
-    
-    if not keep_memory:
+        df = pd.DataFrame([r for r in results if isinstance(r, dict)])
+        df.to_csv(path_to_disk / 'metadata.csv', index=False)
         return df
     
-    grads_samples, grads_params, losses, logits = zip(*records)
-    
-    grads_samples = torch.cat(grads_samples, dim=0)
-    losses = torch.cat(losses, dim=0)
-    logits = torch.cat(logits, dim=0)
-    grads_params = {k: torch.cat([g[k] for g in grads_params], dim=0) for k in grads_params[0]}
-    
-    return df, grads_params, grads_samples, logits, losses
+    if keep_memory:
+        return results
     
 
-
+def process_batch(
+    model, x, y, params, buffers, compute_loss_and_gradients, batch_idx, 
+    device, path_to_disk=None, keep_memory=False
+):
+    """Process a single batch of data."""
+    x, y = x.to(device), y.to(device)
+    (grads_sample, grads_params), (loss, logits) = compute_loss_and_gradients(x, y, params, buffers, model)
     
+    # detach the tensors and move them to the cpugrad_sample
+    grads_sample = grads_sample.detach().cpu()
+    loss = loss.detach().cpu()
+    logits = logits.detach().cpu()
+    y = y.detach().cpu()
+    grads_params = {k: v.detach().cpu() for k, v in grads_params.items()}
+    
+    if path_to_disk:
+        save_batch(path_to_disk, batch_idx, grads_sample, grads_params, loss, logits, y)
+    
+    if keep_memory:
+        return [
+            {
+                'grads_sample': grads_sample[i],
+                'grads_params': {k: v[i] for k, v in grads_params.items()},
+                'loss': loss[i],
+                'logits': logits[i],
+                'label': y[i],
+                'batch_index': batch_idx,
+                'sample_index': i,
+                'grad_sample_path': path_to_disk / f'grad_sample/{batch_idx}_{i}.pt',
+                'grad_params_path': path_to_disk / f'grad_params/{batch_idx}_{i}.pt',
+                'loss_logits_path': path_to_disk / f'loss_logits/{batch_idx}_{i}.pt',
+            }
+            for i in range(grads_sample.shape[0])
+        ]
+    return []
 
-
+def save_batch(path, batch_idx, grads_sample, grads_params, loss, logits, labels):
+    """Saves batch results to a single file."""
+    
+    for i in range(grads_sample.shape[0]):
+        torch.save(grads_sample[i], path  / f'grad_sample/{batch_idx}_{i}.pt', pickle_protocol=4)
+        torch.save({
+                'batch_index': batch_idx,   
+                'sample_index': i,
+                'loss': loss[i].item(),
+                'logits': logits[i],
+                'label': labels[i].item(),
+                'grad_sample_path': path / f'grad_sample/{batch_idx}_{i}.pt',
+                'grad_params_path': path / f'grad_params/{batch_idx}_{i}.pt',
+            }, path / f'loss_logits/{batch_idx}_{i}.pt', pickle_protocol=4)
+        
+        params = {k: v[i] for k, v in grads_params.items()}
+        torch.save(params, path / f'grad_params/{batch_idx}_{i}.pt', pickle_protocol=4)  
         
