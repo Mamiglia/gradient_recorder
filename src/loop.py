@@ -108,9 +108,9 @@ def process_batch(
                 'label': y[i],
                 'batch_index': batch_idx,
                 'sample_index': i,
-                'grad_sample_path': path_to_disk / f'grad_sample/{batch_idx}_{i}.pt',
-                'grad_params_path': path_to_disk / f'grad_params/{batch_idx}_{i}.pt',
-                'loss_logits_path': path_to_disk / f'loss_logits/{batch_idx}_{i}.pt',
+                # 'grad_sample_path': path_to_disk / f'grad_sample/{batch_idx}_{i}.pt',
+                # 'grad_params_path': path_to_disk / f'grad_params/{batch_idx}_{i}.pt',
+                # 'loss_logits_path': path_to_disk / f'loss_logits/{batch_idx}_{i}.pt',
             }
             for i in range(grads_sample.shape[0])
         ]
