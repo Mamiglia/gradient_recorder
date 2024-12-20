@@ -38,18 +38,17 @@ def compute_loss_and_gradients(
 
     Returns:
     - Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]: A tuple containing:
-      - grads_sample (torch.Tensor): Sample-level gradients.
       - loss (torch.Tensor): Loss for the batch.
       - logits (torch.Tensor): Logits for the batch.
-      - grads_params (Dict[str, torch.Tensor]): Parameter-level gradients.
+      - grads (Dict[str, torch.Tensor]): Parameter-level gradients.
     """
     if params is None or buffers is None:
         params = {k: v.detach() for k, v in model.named_parameters()}
         buffers = {k: v.detach() for k, v in model.named_buffers()}
     
     compute_loss_grad_fn = construct_batched_gradient_computation(chunk_size)
-    (grads_sample, grads_params), (loss, logits) = compute_loss_grad_fn(x, y, params, buffers, model)
-    return grads_sample.cpu(), loss.cpu(), logits.cpu(), [{k: v[i].cpu() for k, v in grads_params.items()} for i in range(x.size(0))]
+    grads, (loss, logits) = compute_loss_grad_fn(x, y, params, buffers, model)
+    return loss.cpu(), logits.cpu(), unbatch_state_dict(grads)
 
 def baseline_loss_fn(x: torch.Tensor, y: torch.Tensor, params: Collection[torch.Tensor], 
                      buffer: Collection[torch.Tensor], model: nn.Module) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -71,7 +70,7 @@ def construct_batched_gradient_computation(chunk_size: int, loss_fn=None):
         pass
         
     compute_loss_grad_fn = construct_batched_gradient_computation(chunk_size, loss_fn)
-    (grads_sample, grads_params), (loss, logits) = compute_loss_grad_fn(x, y, params, buffer, model)
+    grads, (loss, logits) = compute_loss_grad_fn(x, y, params, buffer, model)
     
     Parameters:
     - chunk_size (int): The size of chunks for batched gradient computation.
@@ -85,17 +84,16 @@ def construct_batched_gradient_computation(chunk_size: int, loss_fn=None):
             - buffer (Collection[torch.Tensor]): A collection of model buffers.
             - model (nn.Module): The neural network model.
         - The function returns a tuple containing:
-            - grads_sample (torch.Tensor): Sample-level gradients.
-            - grads_params (Dict[str, torch.Tensor]): Parameter-level gradients.
+            - grads (Dict[str, torch.Tensor]): gradients over the model parameters.
             - loss (torch.Tensor): Loss for the batch.
             - logits (torch.Tensor): Logits for the batch.    
     """
     loss_fn = loss_fn or baseline_loss_fn
-    return vmap(              # vmap over the batch dimension
-            grad(                               # gradient over the model parameters and the input
+    return vmap(                # vmap over the batch dimension
+            grad(               # gradient over the model parameters and the input
                 loss_fn, 
-                argnums=(0, 2), has_aux=True    # argnums=(0, 2) means that we want to differentiate with respect to the first and third argument
-                                                # has_aux=True means that the function returns also the loss and the logits
+                argnums=2,      # argnums=2 means that we want to differentiate with respect to the third argument (model parameters)
+                has_aux=True    # has_aux=True means that the function returns also the loss and the logits
             ), in_dims=(0, 0, None, None, None),# in_dims specifies which is the batch dimension of x, y
             chunk_size=chunk_size)
 
@@ -108,9 +106,9 @@ def save_grads_sample(path: Path, grads_sample: torch.Tensor, batch_idx: int = 0
     for i, grad in enumerate(grads_sample):
         torch.save(grad, path / f'grad_sample/{batch_idx}_{i}.pt', pickle_protocol=4)
 
-def save_grads_params(path: Path, grads_params: List[Dict[str, torch.Tensor]], batch_idx: int = 0):
+def save_grads(path: Path, grads: List[Dict[str, torch.Tensor]], batch_idx: int = 0):
     """Save parameter-level gradients to disk."""
-    for i, grads in enumerate(grads_params):
+    for i, grads in enumerate(grads):
         torch.save(grads, path / f'grad_params/{batch_idx}_{i}.pt', pickle_protocol=4)
 
 def save_metadata(path: Path, loss: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor, batch_idx: int = 0):
@@ -123,6 +121,11 @@ def save_metadata(path: Path, loss: torch.Tensor, logits: torch.Tensor, labels: 
             'logits': logits[i],
             'label': labels[i].item(),
         }, path / f'loss_logits/{batch_idx}_{i}.pt', pickle_protocol=4)
+        
+def unbatch_state_dict(state_dict: Dict[str, torch.Tensor], device: torch.device = 'cpu') -> List[Dict[str, torch.Tensor]]:
+    """Unbatch a state dict."""
+    batch_size = next(iter(state_dict.values())).size(0)
+    return [{k: v[i].to(device=device) for k, v in state_dict.items()} for i in range(batch_size)]
 
 # ---------------------------------------
 # Main Functions
@@ -137,16 +140,15 @@ def compute_grad_loss_batch(
     x, y = x.to(device), y.to(device)
     model = model.to(device)
     batch_size = x.size(0)
-    grads_sample, loss, logits, grads_params = compute_loss_and_gradients(x, y, model, params, buffers, chunk_size)
+    loss, logits, grads = compute_loss_and_gradients(x, y, model, params, buffers, chunk_size)
 
     if path_to_disk:
-        save_grads_sample(path_to_disk, grads_sample, batch_idx=batch_idx)
-        save_grads_params(path_to_disk, grads_params, batch_idx=batch_idx)
+        # save_grads_sample(path_to_disk, grads_sample, batch_idx=batch_idx)
+        save_grads(path_to_disk, grads, batch_idx=batch_idx)
         save_metadata(path_to_disk, loss, logits, y, batch_idx=batch_idx)
         return None
 
-    return [{'grads_sample': grads_sample[i], 'grads_params': grads_params[i], 
-             'loss': loss[i], 'logits': logits[i], 'label': y[i]} for i in range(batch_size)]
+    return [{'grads': grads[i], 'loss': loss[i], 'logits': logits[i], 'label': y[i]} for i in range(batch_size)]
 
 def record_model(model, loader, device='cuda', chunk_size=32, path_to_disk=None):
     """Record model behavior over a dataset."""
@@ -156,7 +158,7 @@ def record_model(model, loader, device='cuda', chunk_size=32, path_to_disk=None)
     if path_to_disk:
         path_to_disk = Path(path_to_disk)
         shutil.rmtree(path_to_disk, ignore_errors=True)
-        (path_to_disk / 'grad_sample').mkdir(parents=True)
+        # (path_to_disk / 'grad_sample').mkdir(parents=True)
         (path_to_disk / 'grad_params').mkdir(parents=True)
         (path_to_disk / 'loss_logits').mkdir(parents=True)
 
@@ -168,7 +170,7 @@ def record_model(model, loader, device='cuda', chunk_size=32, path_to_disk=None)
         if result:
             results.extend(result)
 
-    return results if not path_to_disk else None
+    return () if not path_to_disk else None
 
 
 if __name__ == '__main__':
@@ -180,12 +182,12 @@ if __name__ == '__main__':
     y = torch.randint(0, 2, (32,))  # Batch of 32 target labels
     
     # Compute gradients, loss, and logits
-    grads_sample, loss, logits, grads_params = compute_loss_and_gradients(x, y, model)
+    loss, logits, grads = compute_loss_and_gradients(x, y, model)
     
     print("Loss:", loss.shape)
     print("Logits:", logits.shape)
-    print("Sample-level Gradients:", grads_sample.shape) # This is similar to grad-cam
-    print("Parameter-level Gradients:", grads_params[0].keys()) 
+    # print("Sample-level Gradients:", grads_sample.shape) # This is similar to grad-cam
+    print("Parameter-level Gradients:", grads[0].keys()) 
     
     
     ## Record model behavior over a dataset
