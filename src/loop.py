@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import vmap, grad, functional_call
-from typing import Any, Dict, List, Optional, Tuple, Collection
+from typing import Any, Callable, Dict, List, Optional, Tuple, Collection
 from pathlib import Path
 from functools import cache
 from tqdm import tqdm
@@ -16,7 +16,7 @@ from tqdm import tqdm
 # The `vmap` function is used to vectorize the computation over the batch dimension, which allows us to compute gradients for each sample in the batch.
 
 # The function returns sample-level gradients, loss, logits, and parameter-level gradients.
-# The sample-level gradients are similar to Grad-CAM, which can be used to visualize the importance of different parts of the input for the model's prediction.
+# The sample-level gradients are similar to Grad-CAM, which can be used to visualize the importance of different parts of the input for the model's prediction. but we removed them.
 # The parameter-level gradients are the gradients of the loss with respect to the model's parameters.
 
 # If you have any questions ask Tao!
@@ -132,21 +132,39 @@ def unbatch_state_dict(state_dict: Dict[str, torch.Tensor], device: torch.device
 # ---------------------------------------
 
 def compute_grad_loss_batch(
-    model: nn.Module, x: torch.Tensor, y: torch.Tensor, params: Dict[str, torch.Tensor], 
-    buffers: Dict[str, torch.Tensor], device: torch.device, chunk_size: int = 32, 
-    path_to_disk: Optional[Path] = None, batch_idx: int = 0
+    model: nn.Module, 
+    x: torch.Tensor, y: torch.Tensor, 
+    params: Dict[str, torch.Tensor], buffers: Dict[str, torch.Tensor], 
+    device: torch.device, chunk_size: int = 32, loss_fn: Callable = baseline_loss_fn
 ) -> Optional[List[Dict[str, Any]]]:
-    """Compute gradients, loss, and logits for a batch."""
+    """
+    Compute gradients, loss, and logits for a given batch of data using a specified model.
+
+    Parameters:
+    - x (torch.Tensor): The input tensor for the batch.
+    - y (torch.Tensor): The target tensor for the batch.
+    - model (nn.Module): The neural network model.
+    - params (Dict[str, torch.Tensor], optional): A dictionary of model parameters. If not provided, the function will extract parameters from the model.
+    - buffers (Dict[str, torch.Tensor], optional): A dictionary of model buffers. If not provided, the function will extract buffers from the model.
+    - chunk_size (int, optional): The size of chunks for batched gradient computation. Default is 32.
+
+    Returns:
+    - Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]: A tuple containing:
+      - loss (torch.Tensor): Loss for the batch.
+      - logits (torch.Tensor): Logits for the batch.
+      - grads (Dict[str, torch.Tensor]): Parameter-level gradients.
+    """    
     x, y = x.to(device), y.to(device)
     model = model.to(device)
     batch_size = x.size(0)
-    loss, logits, grads = compute_loss_and_gradients(x, y, model, params, buffers, chunk_size)
-
-    if path_to_disk:
-        # save_grads_sample(path_to_disk, grads_sample, batch_idx=batch_idx)
-        save_grads(path_to_disk, grads, batch_idx=batch_idx)
-        save_metadata(path_to_disk, loss, logits, y, batch_idx=batch_idx)
-        return None
+    
+    if params is None or buffers is None:
+        params = {k: v.detach() for k, v in model.named_parameters()}
+        buffers = {k: v.detach() for k, v in model.named_buffers()}
+    
+    compute_loss_grad_fn = construct_batched_gradient_computation(chunk_size, loss_fn = loss_fn)
+    grads, (loss, logits) = compute_loss_grad_fn(x, y, params, buffers, model)
+    loss, logits, grads = loss.cpu(), logits.cpu(), unbatch_state_dict(grads)
 
     return [{'grads': grads[i], 'loss': loss[i], 'logits': logits[i], 'label': y[i]} for i in range(batch_size)]
 
@@ -165,12 +183,12 @@ def record_model(model, loader, device='cuda', chunk_size=32, path_to_disk=None)
     results = []
     for batch_idx, (x, y) in enumerate(tqdm(loader)):
         result = compute_grad_loss_batch(
-            model, x, y, params, buffers, device, chunk_size, path_to_disk, batch_idx
+            model, x, y, params, buffers, device, chunk_size
         )
         if result:
             results.extend(result)
 
-    return () if not path_to_disk else None
+    return results if not path_to_disk else None
 
 
 if __name__ == '__main__':
@@ -196,4 +214,4 @@ if __name__ == '__main__':
     print("Recording model behavior over a dataset...")
     dataset = TensorDataset(torch.randn(1500, 10), torch.randint(0, 2, (1500,)))
     train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
-    record_model(model, train_loader, device='cuda', chunk_size=32, path_to_disk='temp')
+    record_model(model, train_loader, device='cuda', chunk_size=32)
